@@ -221,7 +221,7 @@ init_fn, apply_fn = make_network(network_depth, network_width)
 
 #@title Generate Fixed Embeddings
 
-embedding_size = 256 #@param
+embedding_size = 256# 256 #@param
 
 include_basic = False #@param {type:"boolean"}
 include_posenc = False #@param {type:"boolean"}
@@ -265,16 +265,36 @@ def visualize_encoders(enc_dict, keys=None):
 def mri_mask(shape, nsamp):
   mean = np.array(shape)//2
   cov = np.eye(len(shape)) * (2*shape[0])
-  samps = random.multivariate_normal(rand_key, mean, cov, shape=(1,nsamp))[0,...].astype(np.int32)
+  samps = random.multivariate_normal(rand_key, mean, cov, shape=(1,nsamp*10))[0,...].astype(np.int32)
+  samps = np.unique(samps,axis=0)
+  samps = samps[:nsamp]
+  # Very dirty way to account for redundant samples.
   mask = np.zeros(shape)
   inds = []
   for i in range(samps.shape[-1]):
     inds.append(samps[...,i])
   #mask = index_update(mask, index[inds], 1.)
-  print(inds)
   mask = mask.at[tuple(inds)].set(1.) 
   return mask
 
+def mri_mask_physical(shape, nsamp):
+  z = shape[2]
+  shape = shape[:2]
+  mean = np.array(shape)//2
+  cov = np.eye(len(shape)) * (2*shape[0])
+  nsamp = nsamp//z 
+  samps = random.multivariate_normal(rand_key, mean, cov, shape=(1,nsamp*10))[0,...].astype(np.int32)
+  samps = np.unique(samps,axis=0)
+  samps = samps[:nsamp]
+  # Very dirty way to account for redundant samples.
+  mask = np.zeros(shape)
+  inds = []
+  for i in range(samps.shape[-1]):
+    inds.append(samps[...,i])
+  #mask = index_update(mask, index[inds], 1.)
+  mask = mask.at[tuple(inds)].set(1.) 
+  mask = np.repeat(mask[:,:,np.newaxis],z,axis=2)
+  return mask
 
 @jit
 def run_model(params, x, avals, bvals):
@@ -282,14 +302,18 @@ def run_model(params, x, avals, bvals):
         x = input_encoder(x, avals, bvals)
     return np.reshape(apply_fn(params, np.reshape(x, (-1, x.shape[-1]))), (x.shape[0], x.shape[1], x.shape[2]))
 ifft= lambda x :  np.fft.ifft(np.fft.ifft(np.fft.ifft(x, axis=0), axis=1), axis=2)
+fft= lambda x :  np.fft.fft(np.fft.fft(np.fft.fft(x, axis=0), axis=1), axis=2)
 compute_mri = jit(lambda params, x, a, b, y, mask: np.fft.fft(np.fft.fft(np.fft.fft(run_model(params, x, a, b), axis=0), axis=1), axis=2)*mask.astype(np.complex64))
-model_loss_mri = jit(lambda params, x, a, b, y, mask: .5 * np.mean(np.abs((compute_mri(params, x, a, b, y, mask) - y*mask.astype(np.complex64)) ** 2)))
+model_loss_mri = jit(lambda params, x, a, b, y, mask: .5 * np.mean(np.abs((compute_mri(params, x, a, b, y, mask) - y*mask.astype(np.complex64)) ** 2)))#
+model_loss_mri = jit(lambda params, x, a, b, y, mask: .5 * np.mean(np.abs(run_model(params, x, a, b) - ifft(y*mask.astype(np.complex64)))**2))
 model_loss = jit(lambda params, x, a, b, y, mask, image: .5 * np.abs(np.mean((np.clip(run_model(params, x, a, b), 0.0, 1.0) - image) ** 2)))
+model_loss_us = jit(lambda params, x, a, b, y, mask, image: .5 * np.abs(np.mean((np.clip(np.abs(ifft(y*mask.astype(np.complex64))), 0.0, 1.0) - image) ** 2)))
 model_psnr = jit(lambda params, x, a, b, y, mask, image: -10 * np.log10(2.*model_loss(params, x, a, b, y, mask, image)))
+model_psnr_us = jit(lambda params, x, a, b, y, mask, image: -10 * np.log10(2.*model_loss_us(params, x, a, b, y, mask, image)))
 model_grad_loss = jit(lambda params, x, a, b, y, mask, image: jax.grad(model_loss_mri)(params, x, a, b, y, mask))
 
 
-GROUPS_MODEL = {'Test PSNR':[], 'Train PSNR':[]}
+GROUPS_MODEL = {'Test PSNR':[], 'Train PSNR':[],'Test PSNR undersampled':[], 'Train PSNR undersampled':[]}
 def train_model(lr, iters, train_data, name='', plot_groups=None):
     opt_init, opt_update, get_params = optimizers.adam(lr)
     opt_update = jit(opt_update)
@@ -303,25 +327,35 @@ def train_model(lr, iters, train_data, name='', plot_groups=None):
 
     train_psnrs = []
     test_psnrs = []
+    train_psnrs_us = []
+    test_psnrs_us = []
     xs = []
     if plot_groups is not None:
         plot_groups['Test PSNR'].append(f'{name}_test')
         plot_groups['Train PSNR'].append(f'{name}_train')
-    train_data = [train_data[0],train_data[1], train_data[2], train_data[3]*train_data[4].astype(np.complex64),train_data[4],train_data[5]]
+        plot_groups['Test PSNR undersampled'].append(f'{name}_test_us')
+        plot_groups['Train PSNR undersampled'].append(f'{name}_train_us')
+    #train_data = [train_data[0],train_data[1], train_data[2], train_data[3]*train_data[4].astype(np.complex64),train_data[4],train_data[5]]
     for i in tqdm(range(iters), desc='train iter', leave=False):
         opt_state = opt_update(i, model_grad_loss(get_params(opt_state), *train_data), opt_state)
         if i % 25 == 0:
             train_psnr = model_psnr(get_params(opt_state), *train_data)
             test_psnr = train_psnr #model_psnr(get_params(opt_state), *test_data)
+            train_psnr_us = model_psnr_us(get_params(opt_state), *train_data)
+            test_psnr_us = train_psnr_us #model_psnr(get_params(opt_state), *test_data)
             train_psnrs.append(train_psnr)
             # test_psnrs.append(test_psnr)
             test_psnrs.append(test_psnr)
+            train_psnrs_us.append(train_psnr_us)
+            # test_psnrs.append(test_psnr)
+            test_psnrs_us.append(test_psnr_us)
             xs.append(i)
             if plot_groups is not None:
-                plotlosses_model.update({f'{name}_train':train_psnr, f'{name}_test':test_psnr}, current_step=i)
+                plotlosses_model.update({f'{name}_train':train_psnr, f'{name}_test':test_psnr,f'{name}_train_us':train_psnr_us, f'{name}_test_us':test_psnr_us}, current_step=i)
     if plot_groups is not None:
         plotlosses_model.send()
     set_trace()
+
     if plot_groups is not None:
         plotlosses_model.send()
     results = {
@@ -382,6 +416,8 @@ def train_gridopt(lr, iters, train_data, name='', plot_groups=None):
 
 nsamp = 200000#@param
 mask = np.fft.fftshift(mri_mask((RES,RES,RES), nsamp)).astype(np.complex64)
+#mask = np.fft.fftshift(mri_mask_physical((RES,RES,RES), nsamp)).astype(np.complex64)
+
 print('sparsity:', np.sum(np.abs(mask))/np.prod(np.array(mask.shape)))
 
 
@@ -402,7 +438,7 @@ scales = np.linspace(min_scale, max_scale, num_scales)
 print(f'searching over, {scales}')
 
 if num_images == 1:
-    plt_groups = {'Test PSNR':[], 'Train PSNR':[]}
+    plt_groups = {'Test PSNR':[], 'Train PSNR':[], "Test PSNR undersampled":[], "Train PSNR undersampled":[]}
     plotlosses_model = PlotLosses(groups=plt_groups)
 else:
     plt_groups = None
@@ -503,7 +539,7 @@ target_distribution = "atlas" #@param ["shepp", "atlas"]
 num_images =  1#@param
 
 if num_images == 1:
-    plt_groups = {'Test PSNR':[], 'Train PSNR':[]}
+    plt_groups = {'Test PSNR':[], 'Train PSNR':[], "Test PSNR undersampled":[], "Train PSNR undersampled":[]}
     plotlosses_model = PlotLosses(groups=plt_groups)
 else:
     plt_groups = None
